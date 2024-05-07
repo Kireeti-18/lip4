@@ -1,1 +1,312 @@
 
+# Import all of the dependencies
+import streamlit as st
+import os 
+import tensorflow as tf 
+
+import numpy as np
+from tensorflow.keras.models import Sequential 
+from tensorflow.keras.layers import Conv3D, LSTM, Dense, Dropout, Bidirectional, MaxPool3D, Activation, Reshape, SpatialDropout3D, BatchNormalization, TimeDistributed, Flatten
+import tensorflow as tf
+from typing import List
+import cv2
+import os 
+from gtts import gTTS #the module that the converts audio
+import tkinter as tk
+from tkinter import *
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+import av
+import time
+
+
+from pygame import mixer
+import streamlit as st
+import subprocess
+import keyboard
+
+
+from crop_face import resize_frame
+
+
+
+
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+
+
+
+
+
+def start_record_video():
+    cap = cv2.VideoCapture(0)
+    # Define the codec and create VideoWriter object
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use 'mp4v' for MP4 format
+    out = cv2.VideoWriter('output.mp4', fourcc, 20.0, (640, 480))
+    # Start the video recording loop
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            print("Can't receive frame (stream end?). Exiting ...")
+            break
+        # Write the frame into the file 'output.mp4'
+        out.write(frame)
+        # Display the resulting frame
+        cv2.imshow('frame', frame)
+        # Press 'q' on the keyboard to exit the recording
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    # Release everything when done
+    cap.release()
+    out.release()
+    cv2.destroyAllWindows()
+    file_path = os.path.join('.', "output.mp4")
+    os.system(f'ffmpeg -i {file_path} -vcodec libx264 ./test/video.mpg -y')
+
+
+
+
+def stop_record_video():
+    keyboard.press_and_release('q')
+
+
+
+
+
+def load_video_crop(path:str) -> List[float]: 
+    #print(path)
+    framesCount=0
+    cap = cv2.VideoCapture(path)
+    overall_frames = []
+    frames = []
+    firstFrame=None
+    for _ in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT))): 
+        if framesCount==75:
+            mean = tf.math.reduce_mean(frames)
+            std = tf.math.reduce_std(tf.cast(frames, tf.float32))
+            overall_frames.append(tf.cast((frames - mean), tf.float32) / std)
+            framesCount=0
+            frames = []
+        
+        ret, frame = cap.read()
+        frame = tf.image.rgb_to_grayscale(frame)
+        resize_fra=resize_frame(frame)
+        frames.append(resize_fra)
+        if firstFrame==None:
+            firstFrame=resize_fra
+        framesCount+=1
+
+    cap.release()
+    if len(frames)<75:
+        for i in range(75- len(frames)):
+            frames.append(firstFrame)
+        print(len(frames))
+    mean = tf.math.reduce_mean(frames)
+    std = tf.math.reduce_std(tf.cast(frames, tf.float32))
+    overall_frames.append(tf.cast((frames - mean), tf.float32) / std)
+    return overall_frames
+
+def load_video(path:str): 
+    cap = cv2.VideoCapture(path)
+    frames = []
+    for _ in range(int(cap.get(cv2.CAP_PROP_FRAME_COUNT))): 
+        ret, frame = cap.read()
+        frame = tf.image.rgb_to_grayscale(frame)
+        frames.append(frame[190:236,80:220,:])
+    cap.release()
+    mean = tf.math.reduce_mean(frames)
+    std = tf.math.reduce_std(tf.cast(frames, tf.float32))
+    return [tf.cast((frames - mean), tf.float32) / std]
+
+
+def load_data(path: str): 
+    path = bytes.decode(path.numpy())
+    file_name = path.split('/')[-1].split('.')[0]
+    # File name splitting for windows
+    file_name = path.split('\\')[-1].split('.')[0]
+    video_path = os.path.join('.','test',f'{file_name}.mpg')
+    frames=None
+    if(file_name=="video"):
+        return load_video_crop(video_path) 
+    else:
+        return load_video(video_path) 
+
+
+
+
+
+
+
+def load_model() -> Sequential: 
+    model = Sequential()
+
+    model.add(Conv3D(128, 3, input_shape=(75,46,140, 1), padding='same'))
+    model.add(Activation('relu'))
+    model.add(MaxPool3D((1,2,2)))
+
+    model.add(Conv3D(256, 3, padding='same'))
+    model.add(Activation('relu'))
+    model.add(MaxPool3D((1,2,2)))
+
+    model.add(Conv3D(75, 3, padding='same'))
+    model.add(Activation('relu'))
+    model.add(MaxPool3D((1,2,2)))
+
+    model.add(TimeDistributed(Flatten()))
+
+    model.add(Bidirectional(LSTM(128, kernel_initializer='Orthogonal', return_sequences=True)))
+    model.add(Dropout(.5))
+
+    model.add(Bidirectional(LSTM(128, kernel_initializer='Orthogonal', return_sequences=True)))
+    model.add(Dropout(.5))
+
+    model.add(Dense(41, kernel_initializer='he_normal', activation='softmax'))
+
+    model.load_weights(os.path.join('..','model','checkpoint'))
+
+    return model
+
+
+
+
+
+
+
+
+
+def play_audio(file_name):
+    mixer.init()
+    # Load the audio file
+    mixer.music.load(file_name)
+    mixer.music.play()
+    while mixer.music.get_busy():  # Wait for the audio to finish playing
+        continue
+    mixer.quit()
+    
+
+
+
+vocab = [x for x in "abcdefghijklmnopqrstuvwxyz'?!123456789 "]
+char_to_num = tf.keras.layers.StringLookup(vocabulary=vocab, oov_token="")
+# Mapping integers back to original characters
+num_to_char = tf.keras.layers.StringLookup(
+    vocabulary=char_to_num.get_vocabulary(), oov_token="", invert=True
+)
+
+# Set the layout to the streamlit app as wide 
+st.set_page_config(layout='wide')
+
+
+# Setup the sidebar
+with st.sidebar: 
+    st.image('connect.png')
+    st.title('Connect')
+    st.info('A platform that enables the communcation between deaf, dumb, blind and normal person')
+
+st.title('Connect') 
+# Generating a list of options or videos 
+
+
+import streamlit as st
+import os
+
+options = os.listdir(os.path.join('.', 'test'))
+
+# Add a placeholder at the beginning of the list
+options.insert(0, 'Select a video...')
+class VideoTransformer(VideoTransformerBase):
+    def __init__(self) -> None:
+        self.writer = None
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+
+        # Initialize the writer once we have the video frame size
+        if self.writer is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # Codec
+            self.writer = cv2.VideoWriter('video.mp4', fourcc, 20.0, (img.shape[1], img.shape[0]))
+
+
+        # Write the frame to the video file
+        self.writer.write(img)
+
+
+        # Return the original frame (no modifications)
+        return frame
+
+    def __del__(self):
+        # Release the video writer when the object is destroyed
+        if self.writer is not None:
+            self.writer.release()
+st.warning("Please record more than 5 seconds for better accuracy and wait 5 more seconds after recording..")
+
+webrtc_streamer(key="example", video_processor_factory=VideoTransformer, rtc_configuration=RTC_CONFIGURATION)
+os.system("ffmpeg -i video.mp4 -c:v mpeg2video -q:v 0 -c:a mp2 -f vob ./test/video.mpg -y")
+
+# Create a select box with the placeholder selected by default
+selected_video = st.selectbox('Choose video', options, index=0)
+
+# Check if the user has made a selection other than the placeholder
+if selected_video == 'Select a video...':
+    # Prompt the user to make a selection
+
+    st.warning("Please select a video from the list")
+
+else:
+    # Proceed with handling the selected video
+    st.write(f"You have selected: {selected_video}")
+
+    col1, col2 = st.columns(2)
+
+    # Place 'Stop' button in the second column
+    # Generate two columns 
+
+    if options: 
+        # Rendering the video 
+        with col1: 
+            st.info('video')
+            file_path = os.path.join('.', 'test', selected_video)
+            os.system(f'ffmpeg -i {file_path} -vcodec libx264 test_video.mp4 -y')
+
+            # Rendering inside of the app
+            video = open('test_video.mp4', 'rb') 
+            video_bytes = video.read() 
+            st.video(video_bytes)
+
+        with col2: 
+            st.info('predicted string')
+            video = load_data(tf.convert_to_tensor(file_path))
+            print(video)
+            converted_prediction  =  ''
+            model = load_model()
+            firstFrame=None
+            for video_iter in video:
+                if firstFrame==None:
+                    firstFrame=video_iter[0]
+                    print(firstFrame.shape)
+                if len(video_iter)<75:
+                    for i in range(75- len(video_iter)):
+                        video_iter.append(firstFrame)
+                print(len(video_iter))
+                yhat = model.predict(tf.expand_dims(video_iter, axis=0))
+                decoder = tf.keras.backend.ctc_decode(yhat, [75], greedy=True)[0][0].numpy()
+            
+                # Convert prediction to text
+                
+                text = tf.strings.reduce_join(num_to_char(decoder)).numpy().decode('utf-8')
+                converted_prediction+=text
+            st.text(converted_prediction)
+            language = 'en'
+            # Passing the text and language to the engine, here we have marked slow=False. 
+            # Which tells the module that the converted audio should have a high speed
+            myobj = gTTS(text=converted_prediction, lang=language, slow=False)
+            audio_file = 'audio.mp3'
+            import os, shutil
+
+            os.remove(audio_file)
+
+            myobj.save(audio_file)
+            play_audio(audio_file)
+            st.audio("audio.mp3", format="audio/mpeg")
+
